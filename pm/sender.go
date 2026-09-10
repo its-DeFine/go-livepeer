@@ -161,7 +161,13 @@ func (s *sender) CreateTicketBatch(sessionID string, size int) (*TicketBatch, er
 	for i := 0; i < size; i++ {
 		senderNonce := atomic.AddUint32(&session.senderNonce, 1)
 		ticket := NewTicket(&session.ticketParams, expirationParams, s.signer.Account().Address, senderNonce)
-		sig, err := s.signer.Sign(ticket.Hash().Bytes())
+		var sig []byte
+		var err error
+		if ticketSigner, ok := s.signer.(TicketSigner); ok {
+			sig, err = ticketSigner.SignTicket(ticket)
+		} else {
+			sig, err = s.signer.Sign(ticket.Hash().Bytes())
+		}
 		if err != nil {
 			return nil, errors.Wrapf(err, "error signing ticket for session: %v", sessionID)
 		}

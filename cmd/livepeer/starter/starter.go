@@ -131,6 +131,9 @@ type LivepeerConfig struct {
 	EthAcctAddr                *string
 	EthPassword                *string
 	EthKeystorePath            *string
+	ExternalSignerURL          *string
+	ExternalSignerChainID      *string
+	ExternalSignerTokenFile    *string
 	EthOrchAddr                *string
 	EthUrl                     *string
 	TxTimeout                  *time.Duration
@@ -269,6 +272,9 @@ func DefaultLivepeerConfig() LivepeerConfig {
 	defaultEthAcctAddr := ""
 	defaultEthPassword := ""
 	defaultEthKeystorePath := ""
+	defaultExternalSignerURL := ""
+	defaultExternalSignerChainID := "42161"
+	defaultExternalSignerTokenFile := ""
 	defaultEthOrchAddr := ""
 	defaultEthUrl := ""
 	defaultTxTimeout := 5 * time.Minute
@@ -401,6 +407,9 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		EthAcctAddr:             &defaultEthAcctAddr,
 		EthPassword:             &defaultEthPassword,
 		EthKeystorePath:         &defaultEthKeystorePath,
+		ExternalSignerURL:       &defaultExternalSignerURL,
+		ExternalSignerChainID:   &defaultExternalSignerChainID,
+		ExternalSignerTokenFile: &defaultExternalSignerTokenFile,
 		EthOrchAddr:             &defaultEthOrchAddr,
 		EthUrl:                  &defaultEthUrl,
 		TxTimeout:               &defaultTxTimeout,
@@ -484,6 +493,7 @@ func (cfg LivepeerConfig) PrintConfig(w io.Writer) {
 	// Define sensitive field names that should be redacted
 	sensitiveFields := map[string]bool{
 		"EthPassword":                true,
+		"ExternalSignerTokenFile":    true,
 		"OrchSecret":                 true,
 		"KafkaPassword":              true,
 		"MediaMTXApiPassword":        true,
@@ -810,23 +820,37 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 			exit("Incorrect parameters for selection algorithm, err=%v", err)
 		}
 
-		var keystoreDir = filepath.Join(*cfg.Datadir, "keystore")
-		keystoreInfo, err := parseEthKeystorePath(*cfg.EthKeystorePath)
-		if err == nil {
-			if keystoreInfo.path != "" {
-				keystoreDir = keystoreInfo.path
-			} else if (keystoreInfo.address != ethcommon.Address{}) {
-				ethKeystoreAddr := keystoreInfo.address.Hex()
-				ethAcctAddr := ethcommon.HexToAddress(*cfg.EthAcctAddr).Hex()
-
-				if (ethAcctAddr == ethcommon.Address{}.Hex()) || ethKeystoreAddr == ethAcctAddr {
-					*cfg.EthAcctAddr = ethKeystoreAddr
-				} else {
-					glog.Exit("-ethKeystorePath and -ethAcctAddr were both provided, but ethAcctAddr does not match the address found in keystore")
-				}
+		externalSignerConfigured := *cfg.ExternalSignerURL != "" || *cfg.ExternalSignerChainID != "42161" || *cfg.ExternalSignerTokenFile != ""
+		var keystoreDir string
+		if externalSignerConfigured {
+			if *cfg.EthAcctAddr == "" {
+				glog.Exit("-ethAcctAddr is required when -externalSignerUrl is configured")
+			}
+			if *cfg.ExternalSignerURL == "" || *cfg.ExternalSignerTokenFile == "" {
+				glog.Exit("-externalSignerUrl, -externalSignerChainId, and -externalSignerTokenFile must be configured together")
+			}
+			if *cfg.EthPassword != "" || *cfg.EthKeystorePath != "" {
+				glog.Exit("local keystore flags cannot be combined with -externalSignerUrl")
 			}
 		} else {
-			glog.Exit(err)
+			keystoreDir = filepath.Join(*cfg.Datadir, "keystore")
+			keystoreInfo, err := parseEthKeystorePath(*cfg.EthKeystorePath)
+			if err == nil {
+				if keystoreInfo.path != "" {
+					keystoreDir = keystoreInfo.path
+				} else if (keystoreInfo.address != ethcommon.Address{}) {
+					ethKeystoreAddr := keystoreInfo.address.Hex()
+					ethAcctAddr := ethcommon.HexToAddress(*cfg.EthAcctAddr).Hex()
+
+					if (ethAcctAddr == ethcommon.Address{}.Hex()) || ethKeystoreAddr == ethAcctAddr {
+						*cfg.EthAcctAddr = ethKeystoreAddr
+					} else {
+						glog.Exit("-ethKeystorePath and -ethAcctAddr were both provided, but ethAcctAddr does not match the address found in keystore")
+					}
+				}
+			} else {
+				glog.Exit(err)
+			}
 		}
 
 		//Get the Eth client connection information
@@ -871,15 +895,40 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 		}
 		defer gpm.Stop()
 
-		am, err := eth.NewAccountManager(ethcommon.HexToAddress(*cfg.EthAcctAddr), keystoreDir, chainID, *cfg.EthPassword)
-		if err != nil {
-			glog.Errorf("Error creating Ethereum account manager: %v", err)
-			return
-		}
+		var am eth.AccountManager
+		if externalSignerConfigured {
+			externalChainID, ok := new(big.Int).SetString(*cfg.ExternalSignerChainID, 10)
+			if !ok || externalChainID.Sign() <= 0 || externalChainID.Cmp(chainID) != 0 {
+				glog.Errorf("external signer chain ID %q does not match Ethereum node chain ID %v", *cfg.ExternalSignerChainID, chainID)
+				return
+			}
+			am, err = eth.NewExternalAccountManager(eth.ExternalAccountManagerConfig{
+				Endpoint:  *cfg.ExternalSignerURL,
+				Account:   ethcommon.HexToAddress(*cfg.EthAcctAddr),
+				ChainID:   externalChainID,
+				TokenFile: *cfg.ExternalSignerTokenFile,
+			})
+			if err != nil {
+				glog.Errorf("Error creating external Ethereum account manager: %v", err)
+				return
+			}
+		} else {
+			am, err = eth.NewAccountManager(ethcommon.HexToAddress(*cfg.EthAcctAddr), keystoreDir, chainID, *cfg.EthPassword)
+			if err != nil {
+				glog.Errorf("Error creating Ethereum account manager: %v", err)
+				return
+			}
 
-		if err := am.Unlock(*cfg.EthPassword); err != nil {
-			glog.Errorf("Error unlocking Ethereum account: %v", err)
-			return
+			if err := am.Unlock(*cfg.EthPassword); err != nil {
+				glog.Errorf("Error unlocking Ethereum account: %v", err)
+				return
+			}
+		}
+		if externalSignerConfigured {
+			if err := am.Unlock(""); err != nil {
+				glog.Errorf("Error enabling external Ethereum account manager: %v", err)
+				return
+			}
 		}
 
 		tm := eth.NewTransactionManager(backend, gpm, am, *cfg.TxTimeout, *cfg.MaxTxReplacements)

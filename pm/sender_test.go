@@ -333,6 +333,32 @@ func TestCreateTicketBatch_UsesSessionParamsInBatch(t *testing.T) {
 	}, batch.TicketExpirationParams)
 }
 
+type ticketCaptureSigner struct {
+	*stubSigner
+	ticket *Ticket
+}
+
+func (s *ticketCaptureSigner) SignTicket(ticket *Ticket) ([]byte, error) {
+	s.ticket = ticket
+	return s.signResponse, nil
+}
+
+func TestCreateTicketBatch_UsesOptionalTicketSigner(t *testing.T) {
+	sender := defaultSender(t)
+	base := sender.signer.(*stubSigner)
+	base.signResponse = RandBytes(42)
+	capture := &ticketCaptureSigner{stubSigner: base}
+	sender.signer = capture
+	sessionID := sender.StartSession(defaultTicketParams(t, RandAddress()))
+
+	batch, err := sender.CreateTicketBatch(sessionID, 1)
+	require.NoError(t, err)
+	require.NotNil(t, capture.ticket)
+	assert.Equal(t, batch.Tickets()[0].Hash(), capture.ticket.Hash())
+	assert.Equal(t, base.signResponse, batch.SenderParams[0].Sig)
+	assert.Empty(t, base.signRequests)
+}
+
 func TestCreateTicketBatch_SingleTicket(t *testing.T) {
 	sender := defaultSender(t)
 	am := sender.signer.(*stubSigner)
