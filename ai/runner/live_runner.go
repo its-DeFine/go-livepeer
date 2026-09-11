@@ -108,15 +108,16 @@ func (p LiveRunnerPriceInfo) priceRat() (*big.Rat, error) {
 }
 
 func normalizeLiveRunnerPriceInfo(priceInfo LiveRunnerPriceInfo) (LiveRunnerPriceInfo, error) {
-	if _, err := priceInfo.priceRat(); err != nil {
+	price, err := priceInfo.priceRat()
+	if err != nil {
 		return LiveRunnerPriceInfo{}, err
 	}
 	currency := strings.ToLower(strings.TrimSpace(priceInfo.Currency))
 	if currency == "" {
 		currency = "usd"
 	}
-	if currency != "usd" {
-		return LiveRunnerPriceInfo{}, fmt.Errorf("price_info.currency must be usd")
+	if currency != "usd" && currency != "wei" {
+		return LiveRunnerPriceInfo{}, fmt.Errorf("price_info.currency must be usd or wei")
 	}
 	unit := strings.ToLower(strings.TrimSpace(priceInfo.Unit))
 	if unit == "" {
@@ -128,6 +129,14 @@ func normalizeLiveRunnerPriceInfo(priceInfo LiveRunnerPriceInfo) (LiveRunnerPric
 	case "fixed":
 	default:
 		return LiveRunnerPriceInfo{}, fmt.Errorf("price_info.unit must be hour, 720p, or fixed")
+	}
+	if currency == "wei" {
+		if unit != "fixed" {
+			return LiveRunnerPriceInfo{}, fmt.Errorf("price_info.unit must be fixed for wei prices")
+		}
+		if !price.IsInt() {
+			return LiveRunnerPriceInfo{}, fmt.Errorf("price_info.price must be an integer for wei prices")
+		}
 	}
 	priceInfo.Currency = currency
 	priceInfo.Unit = unit
@@ -1965,10 +1974,14 @@ func newConverterForRunner(priceInfo LiveRunnerPriceInfo) (*core.AutoConvertedPr
 		return nil, err
 	}
 
-	usdPrice, err := priceInfo.priceRat()
+	basePrice, err := priceInfo.priceRat()
 	if err != nil {
 		return nil, err
 	}
+	if priceInfo.Currency == "wei" {
+		return core.NewFixedPrice(basePrice), nil
+	}
+	usdPrice := basePrice
 	switch priceInfo.Unit {
 	case "hour":
 		usdPrice = new(big.Rat).Quo(usdPrice, new(big.Rat).SetInt64(3600))

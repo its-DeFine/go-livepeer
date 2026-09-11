@@ -651,6 +651,16 @@ func TestLiveRunnerRegistry_OnchainRejectsInvalidPriceInfo(t *testing.T) {
 			wantErr:   "price_info.price",
 		},
 		{
+			name:      "zero wei price",
+			priceInfo: LiveRunnerPriceInfo{Price: json.Number("0"), Currency: "wei", Unit: "fixed"},
+			wantErr:   "price_info.price",
+		},
+		{
+			name:      "fractional wei price",
+			priceInfo: LiveRunnerPriceInfo{Price: json.Number("1.5"), Currency: "wei", Unit: "fixed"},
+			wantErr:   "price_info.price",
+		},
+		{
 			name:      "negative price",
 			priceInfo: LiveRunnerPriceInfo{Price: json.Number("-1")},
 			wantErr:   "price_info.price",
@@ -683,6 +693,29 @@ func TestLiveRunnerRegistry_OnchainRejectsInvalidPriceInfo(t *testing.T) {
 				t.Fatalf("expected bad request containing %q, got %v", tt.wantErr, err)
 			}
 		})
+	}
+}
+
+func TestLiveRunnerRegistry_PreservesFixedWEIPrice(t *testing.T) {
+	prevWatcher := core.PriceFeedWatcher
+	core.PriceFeedWatcher = nil
+	defer func() { core.PriceFeedWatcher = prevWatcher }()
+
+	registry := newOnchainLiveRunnerTestRegistry()
+	defer registry.Stop()
+	request := liveRunnerTestHeartbeat("runner-fixed-wei")
+	request.PriceInfo = LiveRunnerPriceInfo{
+		Price: json.Number("39410716386777"), Currency: "wei", Unit: "fixed",
+	}
+	liveRunnerTestRegister(t, registry, request)
+
+	priceInfo, err := registry.PaymentInfo(request.RunnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if priceInfo == nil || priceInfo.Price.String() != "39410716386777" ||
+		priceInfo.Currency != "wei" || priceInfo.Unit != "fixed" {
+		t.Fatalf("unexpected fixed wei price info: %+v", priceInfo)
 	}
 }
 
