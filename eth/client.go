@@ -1172,6 +1172,17 @@ func (c *client) Sign(msg []byte) ([]byte, error) {
 	return c.accountManager.Sign(msg)
 }
 
+// SignWithPreimage uses the optional external preimage-aware signer when
+// configured. Local account managers retain the existing hash-only behavior.
+func (c *client) SignWithPreimage(msgHash, preimage []byte) ([]byte, error) {
+	if signer, ok := c.accountManager.(interface {
+		SignWithPreimage([]byte, []byte) ([]byte, error)
+	}); ok {
+		return signer.SignWithPreimage(msgHash, preimage)
+	}
+	return c.accountManager.Sign(msgHash)
+}
+
 // SignTicket uses the optional full-preimage signer when configured. Local
 // keystore account managers retain the historical hash-only behavior.
 func (c *client) SignTicket(ticket *pm.Ticket) ([]byte, error) {

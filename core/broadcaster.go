@@ -15,7 +15,13 @@ func (bcast *broadcaster) Sign(msg []byte) ([]byte, error) {
 	if bcast.node == nil || bcast.node.Eth == nil {
 		return []byte{}, nil
 	}
-	return bcast.node.Eth.Sign(crypto.Keccak256(msg))
+	msgHash := crypto.Keccak256(msg)
+	if signer, ok := bcast.node.Eth.(interface {
+		SignWithPreimage([]byte, []byte) ([]byte, error)
+	}); ok {
+		return signer.SignWithPreimage(msgHash, msg)
+	}
+	return bcast.node.Eth.Sign(msgHash)
 }
 func (bcast *broadcaster) Address() ethcommon.Address {
 	if bcast.node == nil {

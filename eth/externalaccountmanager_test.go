@@ -116,6 +116,53 @@ func TestExternalAccountManagerSignsTicketPersonalAndTransaction(t *testing.T) {
 	require.Equal(t, account, from)
 }
 
+func TestExternalAccountManagerSignWithPreimage(t *testing.T) {
+	key, err := ethcrypto.GenerateKey()
+	require.NoError(t, err)
+	account := ethcrypto.PubkeyToAddress(key.PublicKey)
+	chainID := big.NewInt(42161)
+	tokenFile := filepath.Join(t.TempDir(), "signer.token")
+	require.NoError(t, os.WriteFile(tokenFile, []byte("test-token"), 0600))
+
+	preimage := []byte("exact segment metadata")
+	messageHash := ethcrypto.Keccak256(preimage)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var request externalSignRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		require.Equal(t, "personal", request.Kind)
+		var payload externalPersonalPayload
+		decodeExternalPayload(t, request.Payload, &payload)
+		require.Equal(t, hexutil.Encode(messageHash), payload.MessageHex)
+		require.Equal(t, hexutil.Encode(preimage), payload.PreimageHex)
+		signExternalMessage(t, w, key, payload.MessageHex)
+	}))
+	defer server.Close()
+
+	manager, err := NewExternalAccountManager(ExternalAccountManagerConfig{
+		Endpoint:  server.URL,
+		Account:   account,
+		ChainID:   chainID,
+		TokenFile: tokenFile,
+	})
+	require.NoError(t, err)
+	require.NoError(t, manager.Unlock(""))
+	signer, ok := manager.(interface {
+		SignWithPreimage([]byte, []byte) ([]byte, error)
+	})
+	require.True(t, ok)
+
+	_, err = signer.SignWithPreimage(ethcrypto.Keccak256([]byte("wrong")), preimage)
+	require.ErrorContains(t, err, "preimage does not match message hash")
+	require.Zero(t, requests)
+
+	signature, err := signer.SignWithPreimage(messageHash, preimage)
+	require.NoError(t, err)
+	require.True(t, crypto.VerifySig(account, messageHash, signature))
+	require.Equal(t, 1, requests)
+}
+
 func TestExternalAccountManagerRejectsRedirects(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "signer.token")
 	require.NoError(t, os.WriteFile(tokenFile, []byte("token"), 0600))

@@ -56,7 +56,8 @@ type externalSignResponse struct {
 }
 
 type externalPersonalPayload struct {
-	MessageHex string `json:"messageHex"`
+	MessageHex  string `json:"messageHex"`
+	PreimageHex string `json:"preimageHex,omitempty"`
 }
 
 type externalTicketPayload struct {
@@ -245,6 +246,25 @@ func (am *externalAccountManager) Sign(msg []byte) ([]byte, error) {
 		return nil, err
 	}
 	return verifyExternalSignature(accounts.TextHash(msg), response.Signature, am.account.Address)
+}
+
+// SignWithPreimage sends a personal-sign request with the exact preimage that
+// produced msgHash, while preserving the existing personal-sign digest.
+func (am *externalAccountManager) SignWithPreimage(msgHash, preimage []byte) ([]byte, error) {
+	if err := am.ready(); err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(crypto.Keccak256(preimage), msgHash) {
+		return nil, fmt.Errorf("external signer preimage does not match message hash")
+	}
+	response, err := am.request("personal", externalPersonalPayload{
+		MessageHex:  hexutil.Encode(msgHash),
+		PreimageHex: hexutil.Encode(preimage),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return verifyExternalSignature(accounts.TextHash(msgHash), response.Signature, am.account.Address)
 }
 
 // SignTicket is the optional full-preimage path used by pm.Sender. It keeps
