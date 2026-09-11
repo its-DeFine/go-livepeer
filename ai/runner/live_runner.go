@@ -1,13 +1,17 @@
 package runner
 
 import (
+	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base32"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/big"
 	"net"
@@ -20,6 +24,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/jaypipes/ghw"
 	"github.com/livepeer/go-livepeer/common"
 	"github.com/livepeer/go-livepeer/core"
@@ -38,6 +43,11 @@ const (
 	proxyIDRandomBytes                 = 16
 	liveRunnerSeedBytes                = 32
 	maxMetadataBytes                   = 1024
+
+	LiveRunnerSessionAdmissionHeader = "Livepeer-Session-Admission"
+	sessionAdmissionTimeout          = 3 * time.Second
+	maxSessionAdmissionResponse      = 64 << 10
+	sessionAdmissionTokenHexBytes    = 24
 )
 
 const (
@@ -125,19 +135,20 @@ func normalizeLiveRunnerPriceInfo(priceInfo LiveRunnerPriceInfo) (LiveRunnerPric
 }
 
 type LiveRunnerHeartbeatRequest struct {
-	RunnerID   string              `json:"runner_id,omitempty"`
-	Label      string              `json:"label,omitempty"`
-	Proxy      bool                `json:"proxy,omitempty"`
-	RunnerURL  string              `json:"runner_url"`
-	Version    string              `json:"version,omitempty"`
-	Metadata   string              `json:"metadata,omitempty"`
-	Status     string              `json:"status,omitempty"`
-	Mode       string              `json:"mode,omitempty"`
-	GPU        *LiveRunnerGPU      `json:"gpu,omitempty"`
-	App        string              `json:"app"`
-	Capacity   int                 `json:"capacity"`
-	PriceInfo  LiveRunnerPriceInfo `json:"price_info"`
-	SessionIDs []string            `json:"session_ids,omitempty"`
+	RunnerID             string              `json:"runner_id,omitempty"`
+	Label                string              `json:"label,omitempty"`
+	Proxy                bool                `json:"proxy,omitempty"`
+	RunnerURL            string              `json:"runner_url"`
+	Version              string              `json:"version,omitempty"`
+	Metadata             string              `json:"metadata,omitempty"`
+	Status               string              `json:"status,omitempty"`
+	Mode                 string              `json:"mode,omitempty"`
+	GPU                  *LiveRunnerGPU      `json:"gpu,omitempty"`
+	App                  string              `json:"app"`
+	Capacity             int                 `json:"capacity"`
+	PriceInfo            LiveRunnerPriceInfo `json:"price_info"`
+	SessionIDs           []string            `json:"session_ids,omitempty"`
+	SessionAdmissionPath string              `json:"session_admission_path,omitempty"`
 }
 
 type StaticLiveRunnerConfig struct {
@@ -145,19 +156,20 @@ type StaticLiveRunnerConfig struct {
 }
 
 type StaticLiveRunnerConfigEntry struct {
-	Label             string              `json:"label,omitempty"`
-	Routing           string              `json:"routing,omitempty"`
-	Proxy             bool                `json:"proxy,omitempty"`
-	RunnerURL         string              `json:"runner_url"`
-	Version           string              `json:"version,omitempty"`
-	Metadata          string              `json:"metadata,omitempty"`
-	Mode              string              `json:"mode,omitempty"`
-	GPU               *LiveRunnerGPU      `json:"gpu,omitempty"`
-	App               string              `json:"app"`
-	Capacity          int                 `json:"capacity"`
-	PriceInfo         LiveRunnerPriceInfo `json:"price_info"`
-	HealthURL         string              `json:"health_url"`
-	HealthyStatusCode int                 `json:"healthy_status_code,omitempty"`
+	Label                string              `json:"label,omitempty"`
+	Routing              string              `json:"routing,omitempty"`
+	Proxy                bool                `json:"proxy,omitempty"`
+	RunnerURL            string              `json:"runner_url"`
+	Version              string              `json:"version,omitempty"`
+	Metadata             string              `json:"metadata,omitempty"`
+	Mode                 string              `json:"mode,omitempty"`
+	GPU                  *LiveRunnerGPU      `json:"gpu,omitempty"`
+	App                  string              `json:"app"`
+	Capacity             int                 `json:"capacity"`
+	PriceInfo            LiveRunnerPriceInfo `json:"price_info"`
+	HealthURL            string              `json:"health_url"`
+	HealthyStatusCode    int                 `json:"healthy_status_code,omitempty"`
+	SessionAdmissionPath string              `json:"session_admission_path,omitempty"`
 }
 
 type StaticLiveRunnerRegistration struct {
@@ -841,16 +853,17 @@ func (r *LiveRunnerRegistry) buildStaticRunner(entry StaticLiveRunnerConfigEntry
 		return LiveRunnerHeartbeatRequest{}, fmt.Errorf("healthy_status_code must be a valid HTTP status code")
 	}
 	req := LiveRunnerHeartbeatRequest{
-		Label:     entry.Label,
-		Proxy:     entry.Proxy,
-		RunnerURL: entry.RunnerURL,
-		Version:   entry.Version,
-		Metadata:  entry.Metadata,
-		Mode:      entry.Mode,
-		GPU:       entry.GPU,
-		App:       entry.App,
-		Capacity:  entry.Capacity,
-		PriceInfo: entry.PriceInfo,
+		Label:                entry.Label,
+		Proxy:                entry.Proxy,
+		RunnerURL:            entry.RunnerURL,
+		Version:              entry.Version,
+		Metadata:             entry.Metadata,
+		Mode:                 entry.Mode,
+		GPU:                  entry.GPU,
+		App:                  entry.App,
+		Capacity:             entry.Capacity,
+		PriceInfo:            entry.PriceInfo,
+		SessionAdmissionPath: entry.SessionAdmissionPath,
 	}
 	return r.normalizeHeartbeat("static", req)
 }
@@ -887,6 +900,11 @@ func (r *LiveRunnerRegistry) normalizeHeartbeat(runnerID string, req LiveRunnerH
 	}
 	req.RunnerID = runnerID
 	req.GPU = cloneLiveRunnerGPU(req.GPU)
+	sessionAdmissionPath, err := normalizeSessionAdmissionPath(req.SessionAdmissionPath, req.Mode)
+	if err != nil {
+		return LiveRunnerHeartbeatRequest{}, err
+	}
+	req.SessionAdmissionPath = sessionAdmissionPath
 
 	if r.offchain {
 		return req, nil
@@ -956,6 +974,11 @@ func (r *LiveRunnerRegistry) ReserveSession(runnerID string, optSessionID ...str
 		return "", "", err
 	}
 	defer unlock()
+	return r.reserveSessionLocked(runner, optSessionID...)
+}
+
+// reserveSessionLocked reserves runner capacity. The caller must hold runner.mu.
+func (r *LiveRunnerRegistry) reserveSessionLocked(runner *liveRunner, optSessionID ...string) (string, string, error) {
 	if !isReadyStatus(runner.Status) {
 		return "", "", &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
 	}
@@ -1004,6 +1027,177 @@ func (r *LiveRunnerRegistry) ReserveSession(runnerID string, optSessionID ...str
 	runner.sendSessionEvent("reserved", id)
 	slog.Info("live runner session reserved", "runner_id", runner.RunnerID, "session_id", id, "app", runner.App)
 	return id, appURL, nil
+}
+
+// sessionAdmissionRequest is sent to the configured application-side admission endpoint.
+type sessionAdmissionRequest struct {
+	Token        string              `json:"token"`
+	RunnerID     string              `json:"runnerId"`
+	PayerAddress string              `json:"payerAddress"`
+	Quote        LiveRunnerPriceInfo `json:"quote"`
+}
+
+type sessionAdmissionResponse struct {
+	Authorized bool `json:"authorized"`
+}
+
+// SessionAdmissionConfigured reports whether a persistent runner has the opt-in
+// covered-session callback configured.
+func (r *LiveRunnerRegistry) SessionAdmissionConfigured(runnerID string) (bool, error) {
+	runner, unlock, err := r.lockLiveRunner(runnerID)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	if !isReadyStatus(runner.Status) || runner.Mode != LiveRunnerModePersistent {
+		return false, &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
+	}
+	return strings.TrimSpace(runner.SessionAdmissionPath) != "", nil
+}
+
+// ReserveCoveredSession obtains a one-use application authorization and then
+// reserves capacity without invoking the native payment path. The runner
+// configuration is revalidated after the callback while holding runner.mu so a
+// callback cannot authorize a different endpoint, mode, or quote.
+func (r *LiveRunnerRegistry) ReserveCoveredSession(ctx context.Context, runnerID, payerAddress, admissionToken string) (string, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !validSessionAdmissionToken(admissionToken) {
+		return "", "", &RunnerError{StatusCode: http.StatusForbidden, Message: "invalid session admission token"}
+	}
+	payerAddress = strings.TrimSpace(payerAddress)
+	if !ethcommon.IsHexAddress(payerAddress) {
+		return "", "", &RunnerError{StatusCode: http.StatusBadRequest, Message: "invalid payer address"}
+	}
+	runner, unlock, err := r.lockLiveRunner(runnerID)
+	if err != nil {
+		return "", "", err
+	}
+	if !isReadyStatus(runner.Status) || runner.Mode != LiveRunnerModePersistent {
+		unlock()
+		return "", "", &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
+	}
+	path := strings.TrimSpace(runner.SessionAdmissionPath)
+	if path == "" {
+		unlock()
+		return "", "", &RunnerError{StatusCode: http.StatusBadRequest, Message: "covered session admission is not configured"}
+	}
+	quote, err := runner.convertPrice()
+	if err != nil {
+		unlock()
+		return "", "", &RunnerError{StatusCode: http.StatusServiceUnavailable, Message: fmt.Sprintf("live runner price unavailable: %v", err)}
+	}
+	runnerURL := runner.RunnerURL
+	unlock()
+
+	callbackURL, err := sessionAdmissionURL(runnerURL, path)
+	if err != nil {
+		return "", "", &RunnerError{StatusCode: http.StatusBadRequest, Message: err.Error()}
+	}
+	authorized, err := callSessionAdmission(ctx, callbackURL, runnerID, payerAddress, admissionToken, quote)
+	if err != nil {
+		return "", "", err
+	}
+	if !authorized {
+		return "", "", &RunnerError{StatusCode: http.StatusForbidden, Message: "session admission denied"}
+	}
+
+	// Reacquire the runner lock and compare every callback-bound field before
+	// allocating. Heartbeats/static updates may otherwise change the target or
+	// price while the one-use callback is in flight.
+	runner, unlock, err = r.lockLiveRunner(runnerID)
+	if err != nil {
+		return "", "", err
+	}
+	defer unlock()
+	if runner.Mode != LiveRunnerModePersistent || runner.RunnerURL != runnerURL || strings.TrimSpace(runner.SessionAdmissionPath) != path {
+		return "", "", &RunnerError{StatusCode: http.StatusConflict, Message: "live runner session admission changed"}
+	}
+	currentQuote, err := runner.convertPrice()
+	if err != nil {
+		return "", "", &RunnerError{StatusCode: http.StatusServiceUnavailable, Message: fmt.Sprintf("live runner price unavailable: %v", err)}
+	}
+	if currentQuote != quote {
+		return "", "", &RunnerError{StatusCode: http.StatusConflict, Message: "live runner session admission price changed"}
+	}
+	return r.reserveSessionLocked(runner)
+}
+
+func validSessionAdmissionToken(token string) bool {
+	token = strings.TrimSpace(token)
+	if len(token) != sessionAdmissionTokenHexBytes*2 {
+		return false
+	}
+	_, err := hex.DecodeString(token)
+	return err == nil
+}
+
+func normalizeSessionAdmissionPath(path, mode string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", nil
+	}
+	if mode != LiveRunnerModePersistent {
+		return "", fmt.Errorf("session_admission_path requires persistent runner mode")
+	}
+	u, err := url.ParseRequestURI(path)
+	if err != nil || u.IsAbs() || u.Host != "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || !strings.HasPrefix(u.Path, "/") || strings.HasPrefix(u.Path, "//") {
+		return "", fmt.Errorf("session_admission_path must be an absolute root-relative path")
+	}
+	if strings.ContainsAny(path, "\\\x00\r\n") {
+		return "", fmt.Errorf("session_admission_path contains forbidden characters")
+	}
+	for _, part := range strings.Split(u.Path, "/") {
+		if part == "." || part == ".." {
+			return "", fmt.Errorf("session_admission_path contains traversal")
+		}
+	}
+	return u.EscapedPath(), nil
+}
+
+func sessionAdmissionURL(runnerURL, admissionPath string) (string, error) {
+	u, err := url.ParseRequestURI(runnerURL)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("invalid runner_url for session admission")
+	}
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: admissionPath}).String(), nil
+}
+
+func callSessionAdmission(ctx context.Context, callbackURL, runnerID, payerAddress, token string, quote LiveRunnerPriceInfo) (bool, error) {
+	body, err := json.Marshal(sessionAdmissionRequest{Token: token, RunnerID: runnerID, PayerAddress: payerAddress, Quote: quote})
+	if err != nil {
+		return false, &RunnerError{StatusCode: http.StatusBadGateway, Message: "could not encode session admission request"}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, bytes.NewReader(body))
+	if err != nil {
+		return false, &RunnerError{StatusCode: http.StatusBadGateway, Message: "could not create session admission request"}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(LiveRunnerSessionAdmissionHeader, token)
+	client := &http.Client{
+		Timeout: sessionAdmissionTimeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, &RunnerError{StatusCode: http.StatusBadGateway, Message: "session admission callback failed"}
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxSessionAdmissionResponse+1))
+	if err != nil || len(responseBody) > maxSessionAdmissionResponse {
+		return false, &RunnerError{StatusCode: http.StatusBadGateway, Message: "invalid session admission response"}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, &RunnerError{StatusCode: http.StatusBadGateway, Message: "session admission callback rejected"}
+	}
+	var response sessionAdmissionResponse
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		return false, &RunnerError{StatusCode: http.StatusBadGateway, Message: "invalid session admission response"}
+	}
+	return response.Authorized, nil
 }
 
 func (r *LiveRunnerRegistry) PaymentInfo(runnerID string) (*LiveRunnerPriceInfo, error) {

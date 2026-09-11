@@ -128,6 +128,14 @@ type liveRunnerManager interface {
 	ResolveSessionProxy(host, path string) (runner.LiveRunnerProxyRoute, bool, error)
 }
 
+// coveredLiveRunnerManager is an opt-in extension implemented by the native
+// runner registry. Keeping it separate preserves existing manager test doubles
+// and the paid reservation path.
+type coveredLiveRunnerManager interface {
+	SessionAdmissionConfigured(runnerID string) (bool, error)
+	ReserveCoveredSession(ctx context.Context, runnerID, payerAddress, admissionToken string) (string, string, error)
+}
+
 func (h *lphttp) liveRunnerManager() (liveRunnerManager, bool) {
 	if h.node == nil {
 		return nil, false
@@ -230,26 +238,69 @@ func (h *lphttp) ReserveLiveRunnerSession(w http.ResponseWriter, r *http.Request
 		respondWithError(w, "only persistent runners have sessions", http.StatusBadRequest)
 		return
 	}
-	priceInfo, err := manager.PaymentInfo(runnerID)
-	if err != nil {
-		respondWithLiveRunnerError(w, err)
-		return
-	}
 	var (
 		sessionID string
 		appURL    string
 	)
-	if priceInfo == nil {
-		sessionID, appURL, err = manager.ReserveSession(runnerID)
+	if coveredManager, ok := manager.(coveredLiveRunnerManager); ok {
+		covered, err := coveredManager.SessionAdmissionConfigured(runnerID)
 		if err != nil {
 			respondWithLiveRunnerError(w, err)
 			return
 		}
+		if covered {
+			if r.Header.Get(paymentHeader) != "" || r.Header.Get(segmentHeader) != "" {
+				respondWithError(w, "covered live runner sessions do not accept payment headers", http.StatusBadRequest)
+				return
+			}
+			payerAddress := strings.TrimSpace(r.Header.Get(liveRunnerSenderHeader))
+			if !ethcommon.IsHexAddress(payerAddress) {
+				respondWithError(w, "invalid payer address", http.StatusBadRequest)
+				return
+			}
+			sessionID, appURL, err = coveredManager.ReserveCoveredSession(r.Context(), runnerID, payerAddress, r.Header.Get(runner.LiveRunnerSessionAdmissionHeader))
+			if err != nil {
+				respondWithLiveRunnerError(w, err)
+				return
+			}
+		} else {
+			priceInfo, err := manager.PaymentInfo(runnerID)
+			if err != nil {
+				respondWithLiveRunnerError(w, err)
+				return
+			}
+			if priceInfo == nil {
+				sessionID, appURL, err = manager.ReserveSession(runnerID)
+				if err != nil {
+					respondWithLiveRunnerError(w, err)
+					return
+				}
+			} else {
+				var reserved bool
+				sessionID, appURL, reserved = h.reservePaidLiveRunnerSession(ctx, w, r, manager, runnerID, priceInfo, nil)
+				if !reserved {
+					return
+				}
+			}
+		}
 	} else {
-		var reserved bool
-		sessionID, appURL, reserved = h.reservePaidLiveRunnerSession(ctx, w, r, manager, runnerID, priceInfo, nil)
-		if !reserved {
+		priceInfo, err := manager.PaymentInfo(runnerID)
+		if err != nil {
+			respondWithLiveRunnerError(w, err)
 			return
+		}
+		if priceInfo == nil {
+			sessionID, appURL, err = manager.ReserveSession(runnerID)
+			if err != nil {
+				respondWithLiveRunnerError(w, err)
+				return
+			}
+		} else {
+			var reserved bool
+			sessionID, appURL, reserved = h.reservePaidLiveRunnerSession(ctx, w, r, manager, runnerID, priceInfo, nil)
+			if !reserved {
+				return
+			}
 		}
 	}
 	controlURL := h.orchestrator.ServiceURI().JoinPath("apps", runnerID, "session", sessionID).String()
