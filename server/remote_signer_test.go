@@ -74,6 +74,15 @@ func (c *testEthClient) SignTypedData(apitypes.TypedData) ([]byte, error) {
 	return []byte("stub"), nil
 }
 
+type failingSignEthClient struct {
+	*testEthClient
+	signErr error
+}
+
+func (c *failingSignEthClient) Sign([]byte) ([]byte, error) {
+	return nil, c.signErr
+}
+
 func TestGenerateLivePayment_RequestValidationErrors(t *testing.T) {
 	require := require.New(t)
 
@@ -405,6 +414,52 @@ func TestGenerateLivePayment_RequestValidationErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGenerateLivePayment_SegmentCredentialsFailureDoesNotCreateTickets(t *testing.T) {
+	require := require.New(t)
+
+	baseClient := newTestEthClient(t)
+	ethClient := &failingSignEthClient{
+		testEthClient: baseClient,
+		signErr:       fmt.Errorf("segment credential signer denied"),
+	}
+	node, err := core.NewLivepeerNode(ethClient, "", nil)
+	require.NoError(err)
+	node.Balances = core.NewAddressBalances(time.Minute)
+	defer node.Balances.StopCleanup()
+
+	ticketCalls := 0
+	node.Sender = newMockSender(mockSenderConfig{
+		ev: big.NewRat(1, 1),
+		createTicketBatchFn: func(_ mock.Arguments, batch *pm.TicketBatch) {
+			ticketCalls++
+			*batch = *defaultTicketBatch()
+		},
+	})
+	ls := &LivepeerServer{LivepeerNode: node}
+
+	oInfo := &net.OrchestratorInfo{
+		Address:   baseClient.addr.Bytes(),
+		PriceInfo: &net.PriceInfo{PricePerUnit: 1, PixelsPerUnit: 1},
+		TicketParams: &net.TicketParams{
+			Recipient: pm.RandAddress().Bytes(),
+		},
+		AuthToken: stubAuthToken,
+	}
+	orchBlob, err := proto.Marshal(oInfo)
+	require.NoError(err)
+	body, err := json.Marshal(RemotePaymentRequest{
+		Orchestrator: orchBlob,
+		InPixels:     1,
+	})
+	require.NoError(err)
+
+	rr := httptest.NewRecorder()
+	ls.GenerateLivePayment(rr, httptest.NewRequest(http.MethodPost, "/generate-live-payment", bytes.NewReader(body)))
+
+	require.Equal(http.StatusInternalServerError, rr.Code)
+	require.Zero(ticketCalls)
 }
 
 func TestParseRemotePaymentMaxPrice(t *testing.T) {

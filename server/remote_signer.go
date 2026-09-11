@@ -627,6 +627,14 @@ func (ls *LivepeerServer) GenerateLivePayment(w http.ResponseWriter, r *http.Req
 	balUpdate.Debit = fee
 	balUpdate.Status = ReceivedChange
 
+	// Generate segment credentials before creating any payment tickets. If the
+	// external signer rejects this request, no ticket has been created.
+	segCreds, err := genSegCreds(sess, &stream.HLSSegment{}, nil, false)
+	if err != nil {
+		respondJsonError(ctx, w, err, http.StatusInternalServerError)
+		return
+	}
+
 	// Generate payment tickets
 	payment, err := genPayment(ctx, sess, balUpdate.NumTickets)
 	if err != nil {
@@ -644,13 +652,6 @@ func (ls *LivepeerServer) GenerateLivePayment(w http.ResponseWriter, r *http.Req
 			statusCode = HTTPStatusPriceExceeded
 		}
 		respondJsonError(ctx, w, err, statusCode)
-		return
-	}
-
-	// Generate segment credentials with an empty segment
-	segCreds, err := genSegCreds(sess, &stream.HLSSegment{}, nil, false)
-	if err != nil {
-		respondJsonError(ctx, w, err, http.StatusInternalServerError)
 		return
 	}
 
