@@ -87,8 +87,8 @@ external account manager instead of a local keystore. Configure all three flags
 ```bash
 ./livepeer \
   -remoteSigner \
-  -network mainnet \
-  -ethUrl <eth-rpc-url> \
+  -network arbitrum-one-mainnet \
+  -ethUrl <arbitrum-rpc-url> \
   -ethAcctAddr <signer-address> \
   -externalSignerUrl http://127.0.0.1:<loopback-port> \
   -externalSignerChainId 42161 \

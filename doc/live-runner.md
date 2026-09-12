@@ -235,7 +235,7 @@ The accepted fork supports two input forms:
 
   ```json
   "price_info": {
-    "price": "40889555888767",
+    "price": 39410716386777,
     "currency": "wei",
     "unit": "fixed"
   }
@@ -436,13 +436,15 @@ fails. If the payment unit is `fixed` then payment is only processed once.
 
 Offchain runners do not issue payment challenges. A persistent runner with
 `session_admission_path` uses the opt-in covered-session callback instead: the
-client supplies `Livepeer-Payer-Address` and a one-use
-`Livepeer-Session-Admission` token, and must not send `Livepeer-Payment` or
-`Livepeer-Segment` on that reservation request. The orchestrator calls the
-runner's root-relative path and reserves capacity only after an
-`{"authorized":true}` response. This callback is an explicit application
-admission path; it is separate from native ticket payment. For the underlying
-ticket protocol, see [Payments](payments.md).
+client supplies `Livepeer-Payer-Address` and a session-admission token, and must
+not send `Livepeer-Payment` or `Livepeer-Segment` on that reservation request.
+The Go runner validates the token shape, forwards the callback, and reserves
+capacity only after an `{"authorized":true}` response. Token issuance, expiry,
+scope, and one-use consumption are application-side responsibilities. In the
+Punch provider runtime, the adapter issues the 48-hex-character token and
+consumes it before scope and expiry checks, so replay is rejected there. This
+callback is separate from native ticket payment. For the underlying ticket
+protocol, see [Payments](payments.md).
 
 ## Reference
 
