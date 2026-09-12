@@ -14,6 +14,33 @@ Support for other pipelines may be added in the future.
 
 With remote signers enabled, a gateway runs in offchain mode while still working with on-chain orchestrators.
 
+## Pinned staging fork and role split
+
+The native payment changes described here are in the accepted staging fork at
+source commit `31bb2224bb22fc9d679c6185e78880dff29f0076`, based on upstream
+v0.9.2 commit `38eb47d12ab1d2d874fc4c7c061aa1900b7c0bad`. The accepted Linux
+amd64 executable is `livepeer-31bb222`, SHA-256
+`a19eb753e22e697cb09e3907beb8ec3146354297baabd5cb599add942188fc92`.
+The Punch CLI package is separate and does not bundle this executable, a native
+wallet, or a signer node. Publish those native source/binary pins separately
+from the CLI package when a staging handoff needs them; this fork pin is not an
+upstream-release claim.
+
+A LiveRunner deployment needs the accepted fork in the **orchestrator** role:
+that process owns runner registration, discovery, session reservation, proxying,
+and recipient-side ticket accounting. The fork's fixed-wei runner input is
+therefore an orchestrator capability. The **payer** can be either a gateway
+running `-gateway` with its own account manager, or a gateway running offchain
+with `-remoteSignerUrl` and a separate `-remoteSigner` node. A remote signer is
+not a substitute for the LiveRunner orchestrator. A separate `-redeemer` may
+own redemption submission when the orchestrator delegates it with
+`-redeemerAddr`.
+
+The same executable serves these roles; the roles use different mode flags and
+state/accounts. The fixed-wei registry path does not require external signing.
+External signing is an optional account-custody path for an on-chain gateway,
+remote signer, orchestrator, or redeemer.
+
 ## Architecture
 
 At a high level, the gateway uses the remote signer to handle Ethereum-related operations such as generating signatures, probabilistic micropayment tickets, or discovering on-chain orchestrators and filtering them by price and capability:
@@ -52,6 +79,31 @@ The remote signer is intended to be its own standalone node type. The `-remoteSi
 **The remote signer requires an on-chain network**. It cannot run with `-network=offchain` because it must have on-chain Ethereum connectivity to sign and manage payment tickets.
 
 The remote signer must have typical Ethereum flags configured (examples: `-network`, `-ethUrl`, `-ethController`, keystore/password flags). See the go-livepeer [devtool](https://github.com/livepeer/go-livepeer/blob/92bdb59f169056e3d1beba9b511554ea5d9eda72/cmd/devtool/devtool.go#L200-L212) for an example of what flags might be required.
+
+On the accepted staging fork, the remote signer may use an owner-controlled
+external account manager instead of a local keystore. Configure all three flags
+`together`:
+
+```bash
+./livepeer \
+  -remoteSigner \
+  -network mainnet \
+  -ethUrl <eth-rpc-url> \
+  -ethAcctAddr <signer-address> \
+  -externalSignerUrl http://127.0.0.1:<loopback-port> \
+  -externalSignerChainId 42161 \
+  -externalSignerTokenFile <0600-token-file>
+```
+
+When this triplet is configured, `-ethAcctAddr` is required, the asserted chain
+ID must match the chain returned by `-ethUrl`, and `-ethPassword` and
+`-ethKeystorePath` must be omitted. The endpoint must be loopback; the token
+file must be a regular file with no group/world permissions. Without the
+triplet, the node uses its local keystore. The manager signs the payment
+preimages and transactions requested by the node; it does not remove the
+remote signer's on-chain account, deposit, RPC, or PM limits. The exact
+`POST /v1/sign` payload kinds and ticket preimage contract are in
+[`eth/external-signing-protocol.md`](../eth/external-signing-protocol.md).
 
 The remote signer listens to the standard go-livepeer HTTP port (8935) by default. Change the port or interface with the `-httpAddr` flag. The CLI webserver defaults to `127.0.0.1:3935` (loopback only). Override it with `-cliAddr`.
 
@@ -135,6 +187,14 @@ capabilities.
 Currently, remote discovery can only be enabled for nodes in remote signing mode.
 
 ### Gateway node
+
+A gateway that pays directly uses the same accepted executable with `-gateway`
+(or the deprecated `-broadcaster` alias) and its own on-chain account. It can
+use the local keystore, or the external account manager triplet shown above:
+`-ethAcctAddr`, `-externalSignerUrl`, `-externalSignerChainId`, and
+`-externalSignerTokenFile`; do not combine that triplet with
+`-ethPassword` or `-ethKeystorePath`. A gateway that sets `-remoteSignerUrl`
+uses the separate remote-signer payer path below instead.
 
 Configure a gateway to use a remote signer with:
 

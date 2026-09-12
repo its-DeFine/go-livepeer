@@ -8,13 +8,46 @@ publish-subscribe channels.
 
 This guide covers the live-runner registry, session, discovery, and proxy APIs.
 
-This document has two parts:
+This document has three parts:
 
+- [Pinned staging extension](#pinned-staging-extension) identifies the exact
+  fork and the role split for the opt-in native payment path.
 - [Understanding live runners](#understanding-live-runners) explains the
   architecture, registration models, lifecycle, discovery, proxying, capacity,
   and pricing.
 - [Reference](#reference) lists the static configuration schema, CLI flags,
   dynamic runner protocol, and HTTP endpoints.
+
+## Pinned staging extension
+
+The fixed-wei runner price and covered-session additions in this document are
+implemented by the accepted staging fork at source commit
+`31bb2224bb22fc9d679c6185e78880dff29f0076`, based on upstream v0.9.2 commit
+`38eb47d12ab1d2d874fc4c7c061aa1900b7c0bad`. The accepted native executable is
+`livepeer-31bb222` for Linux amd64, SHA-256
+`a19eb753e22e697cb09e3907beb8ec3146354297baabd5cb599add942188fc92`.
+These are staging pins; they do not assert an upstream release.
+
+The same `livepeer` executable is configured in separate roles. The
+`-orchestrator` process must run the accepted fork to register, advertise,
+reserve, proxy, and account LiveRunner sessions. It accepts the static and
+dynamic runner price form `{"currency":"wei","unit":"fixed"}` described
+below. A gateway can pay directly with `-gateway` (the deprecated
+`-broadcaster` alias is also accepted), or it can run offchain with
+`-remoteSignerUrl` and delegate payment signing to a separate on-chain
+`-remoteSigner` process. The remote signer is a payer service, not the
+LiveRunner orchestrator. A separate `-redeemer` can submit recipient redemptions
+when the orchestrator is configured with `-redeemerAddr`; it does not replace
+the orchestrator registry or proxy.
+
+The fixed-wei registry path is therefore an orchestrator requirement. Installing
+an external signer for a payer does not make an upstream orchestrator accept a
+fixed-wei runner configuration. Conversely, external signing is optional for an
+orchestrator or gateway that uses its local keystore. The Punch CLI package is a
+separate client package: it does not contain this native executable, a native
+wallet, or a signer node. Any public staging handoff must publish the native
+binary checksum and source pin separately from the CLI package, together with
+this role mapping and `eth/external-signing-protocol.md`.
 
 ## Understanding live runners
 
@@ -191,18 +224,26 @@ heartbeat TTL and cannot call the heartbeat unregister endpoint.
 #### Static pricing
 
 On an on-chain network, every runner must provide a positive `price_info.price`.
-The registration price is denominated in USD:
+The accepted fork supports two input forms:
 
-- `currency` defaults to `usd`; no other registration currency is accepted.
-- `unit` defaults to `hour` and accepts `hour`, `720p`, or `fixed`.
-- `hour` is converted to a wei-per-second discovery/payment price.
-- `720p` is converted using 720p at 30 fps and is advertised in
-  `720p-pixel-seconds`.
-- `fixed` is converted directly from USD to wei without a time or pixel
-  divisor and is advertised as `fixed`.
+- `currency` defaults to `usd`. With USD, `unit` defaults to `hour` and accepts
+  `hour`, `720p`, or `fixed`; the node converts the price with its USD/ETH
+  feed and advertises the resulting wei price.
+- `currency: "wei"` is an opt-in fixed-price form. It requires
+  `unit: "fixed"` and an integer `price`; the value is used directly in wei
+  without a price-feed conversion. For example:
 
-The conversion follows the node's USD/ETH price feed. On an offchain network,
-runner prices are not advertised and no payment challenge is required.
+  ```json
+  "price_info": {
+    "price": "40889555888767",
+    "currency": "wei",
+    "unit": "fixed"
+  }
+  ```
+
+The discovery output is always a positive wei price with unit `seconds`,
+`720p-pixel-seconds`, or `fixed`, depending on the runner input. On an offchain
+network, runner prices are not advertised and no payment challenge is required.
 
 ### Dynamic registration
 
@@ -393,8 +434,15 @@ parameters. The client retries the same request with `Livepeer-Payment` and
 usage on its configured payment interval and releases the session if payment
 fails. If the payment unit is `fixed` then payment is only processed once.
 
-Offchain runners do not issue payment challenges. For the underlying ticket
-protocol, see [Payments](payments.md).
+Offchain runners do not issue payment challenges. A persistent runner with
+`session_admission_path` uses the opt-in covered-session callback instead: the
+client supplies `Livepeer-Payer-Address` and a one-use
+`Livepeer-Session-Admission` token, and must not send `Livepeer-Payment` or
+`Livepeer-Segment` on that reservation request. The orchestrator calls the
+runner's root-relative path and reserves capacity only after an
+`{"authorized":true}` response. This callback is an explicit application
+admission path; it is separate from native ticket payment. For the underlying
+ticket protocol, see [Payments](payments.md).
 
 ## Reference
 
@@ -417,7 +465,8 @@ are currently ignored. Labels in one submitted batch must be unique.
 | `mode` | string | Default: `persistent` | `persistent`, `single-shot`, or the normalized alias `single_shot`. |
 | `capacity` | integer | Default: `1` when zero | Maximum concurrent sessions. Negative values are invalid. |
 | `gpu` | object or integer | Optional | Object fields are `id`, `name`, and `vram_mb`. An integer is treated as a local device index; a negative index records only that numeric ID and skips hardware lookup. |
-| `price_info` | object | Required onchain; ignored for offchain payment/discovery | `price` is a positive decimal. `currency` defaults to and must equal `usd`. `unit` defaults to `hour` and accepts `hour`, `720p`, or `fixed`. |
+| `price_info` | object | Required onchain; ignored for offchain payment/discovery | `price` is positive. USD prices are decimal and use the USD/ETH feed. The accepted fork also allows an integer `price` with `currency: "wei"` and `unit: "fixed"`; that value is already wei. |
+| `session_admission_path` | string | Default: empty | Optional root-relative callback path for a `persistent` covered session. The callback is invoked by the orchestrator before capacity is reserved; it is invalid for `single-shot`. |
 
 ### CLI flags
 
