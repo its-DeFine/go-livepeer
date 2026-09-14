@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -1199,14 +1202,15 @@ func TestNewWHOrchestratorPoolCache(t *testing.T) {
 
 	// mock webhook and orchestrator info request
 	addresses := []string{"https://127.0.0.1:8936", "https://127.0.0.1:8937", "https://127.0.0.1:8938"}
-
-	getURLsfromWebhook = func(cbUrl *url.URL) ([]byte, error) {
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var wh []webhookResponse
 		for _, addr := range addresses {
 			wh = append(wh, webhookResponse{Address: addr})
 		}
-		return json.Marshal(&wh)
-	}
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(json.NewEncoder(w).Encode(wh))
+	}))
+	defer webhook.Close()
 
 	wg := sync.WaitGroup{}
 	oldOrchInfo := serverGetOrchInfo
@@ -1217,7 +1221,7 @@ func TestNewWHOrchestratorPoolCache(t *testing.T) {
 	}
 
 	// assert created webhook pool is correct length
-	whURL, _ := url.ParseRequestURI("https://livepeer.live/api/orchestrator")
+	whURL, _ := url.ParseRequestURI(webhook.URL)
 	whpool := NewWebhookPool(&stubBroadcaster{}, whURL, 500*time.Millisecond)
 	assert.Equal(3, whpool.Size())
 
@@ -1301,6 +1305,220 @@ func TestNewWHOrchestratorPoolCache(t *testing.T) {
 		uri, _ := url.ParseRequestURI(addr)
 		assert.Contains(removeLatency(infos), common.OrchestratorLocalInfo{URL: uri, Latency: nil})
 	}
+}
+
+func TestWebhookPoolConfig_ForwardsHeaders(t *testing.T) {
+	require := require.New(t)
+
+	headersCh := make(chan map[string]string, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headersCh <- map[string]string{
+			"Authorization": r.Header.Get("Authorization"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(json.NewEncoder(w).Encode([]webhookResponse{{Address: "https://127.0.0.1:8936"}}))
+	}))
+	defer webhook.Close()
+
+	whURL, err := url.ParseRequestURI(webhook.URL)
+	require.NoError(err)
+
+	whpool := WebhookPoolConfig{
+		Broadcaster:      &stubBroadcaster{},
+		Callback:         whURL,
+		Headers:          map[string]string{"Authorization": "Bearer gateway-token"},
+		DiscoveryTimeout: 500 * time.Millisecond,
+	}.New()
+	_ = whpool.Size()
+
+	select {
+	case gotHeaders := <-headersCh:
+		require.Equal("Bearer gateway-token", gotHeaders["Authorization"])
+	case <-time.After(time.Second):
+		require.Fail("timed out waiting for webhook call")
+	}
+}
+
+func TestWebhookPool_UsesCachedInfosOnRefreshError(t *testing.T) {
+	type webhookReply struct {
+		status int
+		body   string
+	}
+
+	newPool := func(t *testing.T, initial webhookReply) (*webhookPool, func(webhookReply)) {
+		t.Helper()
+
+		var replyMu sync.RWMutex
+		reply := initial
+		webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			replyMu.RLock()
+			current := reply
+			replyMu.RUnlock()
+
+			w.WriteHeader(current.status)
+			_, _ = w.Write([]byte(current.body))
+		}))
+		t.Cleanup(webhook.Close)
+
+		whURL, err := url.ParseRequestURI(webhook.URL)
+		require.NoError(t, err)
+		pool := &webhookPool{
+			callback:         whURL,
+			mu:               &sync.RWMutex{},
+			bcast:            &stubBroadcaster{},
+			discoveryTimeout: 500 * time.Millisecond,
+			getOrchInfo: func(ctx context.Context, bcast common.Broadcaster, orchestratorServer *url.URL, params server.GetOrchestratorInfoParams) (*net.OrchestratorInfo, error) {
+				return &net.OrchestratorInfo{Transcoder: orchestratorServer.String()}, nil
+			},
+		}
+
+		setReply := func(next webhookReply) {
+			replyMu.Lock()
+			reply = next
+			replyMu.Unlock()
+		}
+		return pool, setReply
+	}
+
+	const cachedURL = "https://127.0.0.1:8936"
+	goodReply := webhookReply{
+		status: http.StatusOK,
+		body:   `[{"address":"` + cachedURL + `"}]`,
+	}
+
+	t.Run("timeout", func(t *testing.T) {
+		pool, _ := newPool(t, goodReply)
+		infos, err := pool.getInfos()
+		require.NoError(t, err)
+		require.Len(t, infos, 1)
+		require.Equal(t, cachedURL, infos[0].URL.String())
+
+		synctest.Test(t, func(t *testing.T) {
+			staleRequest := time.Now().Add(-2 * common.WebhookDiscoveryRefreshInterval)
+			pool.mu.Lock()
+			pool.lastRequest = staleRequest
+			pool.mu.Unlock()
+			time.Sleep(3 * time.Second)
+
+			infos, err = pool.cachedInfosOnError(context.DeadlineExceeded)
+			require.NoError(t, err)
+			require.Len(t, infos, 1)
+			require.Equal(t, cachedURL, infos[0].URL.String())
+			require.Equal(t, staleRequest, pool.lastRequest, "failed refresh must remain eligible for retry")
+		})
+	})
+
+	tests := []struct {
+		name    string
+		failure webhookReply
+	}{
+		{
+			name: "non-2xx response",
+			failure: webhookReply{
+				status: http.StatusBadGateway,
+				body:   `[]`,
+			},
+		},
+		{
+			name: "malformed JSON",
+			failure: webhookReply{
+				status: http.StatusOK,
+				body:   `{not-json`,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pool, setReply := newPool(t, goodReply)
+			infos, err := pool.getInfos()
+			require.NoError(t, err)
+			require.Len(t, infos, 1)
+			require.Equal(t, cachedURL, infos[0].URL.String())
+
+			setReply(test.failure)
+			staleRequest := time.Now().Add(-2 * common.WebhookDiscoveryRefreshInterval)
+			pool.mu.Lock()
+			pool.lastRequest = staleRequest
+			pool.mu.Unlock()
+
+			infos, err = pool.getInfos()
+			require.NoError(t, err)
+			require.Len(t, infos, 1)
+			require.Equal(t, cachedURL, infos[0].URL.String())
+			require.Equal(t, staleRequest, pool.lastRequest, "failed refresh must remain eligible for retry")
+
+			if test.name == "non-2xx response" {
+				require.Equal(t, 1, pool.Size())
+				orchestrators, err := pool.GetOrchestrators(context.Background(), 1, newStubSuspender(), newStubCapabilities(), common.ScoreAtLeast(0))
+				require.NoError(t, err)
+				require.Len(t, orchestrators, 1)
+			}
+		})
+	}
+}
+
+func TestWebhookPool_RefreshErrorWithoutCache(t *testing.T) {
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer webhook.Close()
+
+	whURL, err := url.ParseRequestURI(webhook.URL)
+	require.NoError(t, err)
+	pool := &webhookPool{
+		callback: whURL,
+		mu:       &sync.RWMutex{},
+		bcast:    &stubBroadcaster{},
+	}
+
+	infos, err := pool.getInfos()
+	require.Error(t, err)
+	require.Nil(t, infos)
+	require.Nil(t, pool.pool)
+	require.True(t, pool.lastRequest.IsZero())
+	require.Zero(t, pool.Size())
+}
+
+func TestWebhookPool_SuccessfulEmptyRefreshClearsCache(t *testing.T) {
+	var replyMu sync.RWMutex
+	body := `[{"address":"https://127.0.0.1:8936"}]`
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		replyMu.RLock()
+		currentBody := body
+		replyMu.RUnlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(currentBody))
+	}))
+	defer webhook.Close()
+
+	whURL, err := url.ParseRequestURI(webhook.URL)
+	require.NoError(t, err)
+	pool := &webhookPool{
+		callback: whURL,
+		mu:       &sync.RWMutex{},
+		bcast:    &stubBroadcaster{},
+	}
+
+	infos, err := pool.getInfos()
+	require.NoError(t, err)
+	require.Len(t, infos, 1)
+
+	replyMu.Lock()
+	body = `[]`
+	replyMu.Unlock()
+	staleRequest := time.Now().Add(-2 * common.WebhookDiscoveryRefreshInterval)
+	pool.mu.Lock()
+	pool.lastRequest = staleRequest
+	pool.mu.Unlock()
+
+	infos, err = pool.getInfos()
+	require.NoError(t, err)
+	require.Empty(t, infos)
+	require.NotNil(t, pool.pool)
+	require.Zero(t, pool.Size())
+	require.True(t, pool.lastRequest.After(staleRequest))
 }
 
 func TestDeserializeWebhookJSON(t *testing.T) {
@@ -1442,9 +1660,8 @@ func TestOrchestratorPool_GetOrchestrators_SuspendedOrchs(t *testing.T) {
 	wg := sync.WaitGroup{}
 
 	orchCb := func() error { return nil }
-	oldOrchInfo := serverGetOrchInfo
-	defer func() { wg.Wait(); serverGetOrchInfo = oldOrchInfo }()
-	serverGetOrchInfo = func(ctx context.Context, bcast common.Broadcaster, server *url.URL, params server.GetOrchestratorInfoParams) (*net.OrchestratorInfo, error) {
+	defer wg.Wait()
+	getOrchInfo := func(ctx context.Context, bcast common.Broadcaster, server *url.URL, params server.GetOrchestratorInfoParams) (*net.OrchestratorInfo, error) {
 		defer wg.Done()
 		err := orchCb()
 		return &net.OrchestratorInfo{
@@ -1453,6 +1670,7 @@ func TestOrchestratorPool_GetOrchestrators_SuspendedOrchs(t *testing.T) {
 	}
 
 	pool := NewOrchestratorPool(&stubBroadcaster{}, addresses, common.Score_Trusted, []string{}, 50*time.Millisecond)
+	pool.getOrchInfo = getOrchInfo
 
 	// suspend https://127.0.0.1:8938
 	sus := newStubSuspender()
@@ -2129,6 +2347,105 @@ func sync_TestOrchestratorPool_LatencySorting(t *testing.T) {
 
 func TestOrchestratorPool_LatencySorting(t *testing.T) {
 	synctest.Test(t, sync_TestOrchestratorPool_LatencySorting)
+}
+
+func TestFetchOrchestratorEndpointDiscovery(t *testing.T) {
+	t.Run("valid entries", func(t *testing.T) {
+		var serverURL string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			require.Equal(t, "/discovery", r.URL.Path)
+			_, _ = fmt.Fprintf(w, `[
+				{"address":"https://other.example.com","runners":[{"app":"live-video-to-video/other"}]},
+				{"address":%q,"runners":[{"app":"live-video-to-video/model-a"}]}
+			]`, serverURL)
+		}))
+		defer ts.Close()
+		serverURL = ts.URL
+
+		orchURI, err := url.ParseRequestURI(ts.URL)
+		require.NoError(t, err)
+		discovery, err := callOrchestratorDiscovery(context.Background(), orchURI)
+		require.NoError(t, err)
+		var entries []map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(discovery, &entries))
+		require.Len(t, entries, 2)
+		require.JSONEq(t, `"https://other.example.com"`, string(entries[0]["address"]))
+		require.JSONEq(t, fmt.Sprintf("%q", ts.URL), string(entries[1]["address"]))
+		require.Contains(t, string(entries[1]["runners"]), "live-video-to-video/model-a")
+	})
+
+	t.Run("non-200 is non-fatal error", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+		}))
+		defer ts.Close()
+
+		orchURI, err := url.ParseRequestURI(ts.URL)
+		require.NoError(t, err)
+		discovery, err := callOrchestratorDiscovery(context.Background(), orchURI)
+		require.Error(t, err)
+		require.Nil(t, discovery)
+	})
+
+	t.Run("invalid JSON", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`not-json`))
+		}))
+		defer ts.Close()
+
+		orchURI, err := url.ParseRequestURI(ts.URL)
+		require.NoError(t, err)
+		discovery, err := callOrchestratorDiscovery(context.Background(), orchURI)
+		require.Error(t, err)
+		require.Nil(t, discovery)
+	})
+
+	t.Run("oversized response", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(strings.Repeat("x", orchestratorEndpointDiscoveryMaxBytes+1)))
+		}))
+		defer ts.Close()
+
+		orchURI, err := url.ParseRequestURI(ts.URL)
+		require.NoError(t, err)
+		discovery, err := callOrchestratorDiscovery(context.Background(), orchURI)
+		require.Error(t, err)
+		require.Nil(t, discovery)
+	})
+
+	t.Run("entries without matching address are returned", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`[{"address":"https://other.example.com"}]`))
+		}))
+		defer ts.Close()
+
+		orchURI, err := url.ParseRequestURI(ts.URL)
+		require.NoError(t, err)
+		discovery, err := callOrchestratorDiscovery(context.Background(), orchURI)
+		require.NoError(t, err)
+		var entries []map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(discovery, &entries))
+		require.Len(t, entries, 1)
+		require.JSONEq(t, `"https://other.example.com"`, string(entries[0]["address"]))
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		oldTimeout := orchestratorEndpointDiscoveryTimeout
+		orchestratorEndpointDiscoveryTimeout = time.Millisecond
+		defer func() { orchestratorEndpointDiscoveryTimeout = oldTimeout }()
+
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(20 * time.Millisecond)
+			_, _ = w.Write([]byte(`[]`))
+		}))
+		defer ts.Close()
+
+		orchURI, err := url.ParseRequestURI(ts.URL)
+		require.NoError(t, err)
+		discovery, err := callOrchestratorDiscovery(context.Background(), orchURI)
+		require.Error(t, err)
+		require.Nil(t, discovery)
+	})
 }
 
 func wgWait(wg *sync.WaitGroup) bool {

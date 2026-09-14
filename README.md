@@ -6,7 +6,7 @@
 
 ---
 [![Go Report Card](https://goreportcard.com/badge/github.com/livepeer/go-livepeer)](https://goreportcard.com/report/github.com/livepeer/go-livepeer)
-[![Discord](https://img.shields.io/discord/423160867534929930.svg?style=flat-square)](https://discord.gg/livepeer)
+[![Discord](https://img.shields.io/discord/423160867534929930.svg?style=flat-square)](https://discord.gg/55SZFEEH5y)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Contributions welcome](https://img.shields.io/badge/contributions-welcome-orange.svg?style=flat-square)](CONTRIBUTING.md)
 
@@ -38,7 +38,7 @@ This project requires `go` and a unix shell.
 
 ## Getting Started
 
-To get started, clone the repo and follow the [installation guide](https://docs.livepeer.org/guides/orchestrating/install-go-livepeer).
+To get started, clone the repo and follow the [installation guide](https://docs.livepeer.org/v2/orchestrators/setup/install).
 
 Next, follow [the guide to set up a private ETH network with the Livepeer protocol deployed](cmd/devtool/README.md).
 
@@ -63,5 +63,5 @@ other resources:
 - 📖 [The Livepeer Docs](https://livepeer.org/docs)
 - 🔭 [The 10-Minute Primer](https://livepeer.org/primer/)
 - ✍ [The Livepeer Blog](https://medium.com/livepeer-blog)
-- 💬 [The Livepeer Chat](https://discord.gg/livepeer)
+- 💬 [The Livepeer Chat](https://discord.gg/55SZFEEH5y)
 - ❓ [The Livepeer Forum](https://forum.livepeer.org/)

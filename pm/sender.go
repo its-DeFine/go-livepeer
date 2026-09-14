@@ -161,7 +161,13 @@ func (s *sender) CreateTicketBatch(sessionID string, size int) (*TicketBatch, er
 	for i := 0; i < size; i++ {
 		senderNonce := atomic.AddUint32(&session.senderNonce, 1)
 		ticket := NewTicket(&session.ticketParams, expirationParams, s.signer.Account().Address, senderNonce)
-		sig, err := s.signer.Sign(ticket.Hash().Bytes())
+		var sig []byte
+		var err error
+		if ticketSigner, ok := s.signer.(TicketSigner); ok {
+			sig, err = ticketSigner.SignTicket(ticket)
+		} else {
+			sig, err = s.signer.Sign(ticket.Hash().Bytes())
+		}
 		if err != nil {
 			return nil, errors.Wrapf(err, "error signing ticket for session: %v", sessionID)
 		}
@@ -185,7 +191,7 @@ func (s *sender) validateTicketParams(ticketParams *TicketParams, numTickets int
 	}
 
 	if ticketParams.ExpirationBlock.Int64() == 0 {
-		return nil
+		return fmt.Errorf("ticketParams expiration block is 0")
 	}
 
 	latestL1Block := s.timeManager.LastSeenL1Block()
@@ -200,7 +206,8 @@ func (s *sender) validateTicketParams(ticketParams *TicketParams, numTickets int
 		return nil
 	}
 
-	if ev.Cmp(new(big.Rat).SetInt(ticketParams.FaceValue)) >= 0 {
+	// A certain ticket has EV equal to face value; it must still pass every cap below.
+	if ev.Cmp(new(big.Rat).SetInt(ticketParams.FaceValue)) > 0 {
 		return fmt.Errorf("ticket faceValue too low faceValue=%v", ticketParams.FaceValue)
 	}
 	if ev.Cmp(s.maxEV) > 0 {

@@ -567,15 +567,17 @@ func (ls *LivepeerServer) StartLiveVideo() http.Handler {
 		ctx = clog.AddVal(ctx, "stream_id", streamID)
 		clog.Infof(ctx, "Received live video AI request for %s. pipelineParams=%v", streamName, pipelineParams)
 
-		// collect all RTMP outputs
+		// collect all RTMP outputs (optional; WHEP uses the ring buffer instead)
 		var rtmpOutputs []string
-		if outputURL != "" {
-			rtmpOutputs = append(rtmpOutputs, outputURL)
+		if !media.LiveAIDisableRTMPOutput() {
+			if outputURL != "" {
+				rtmpOutputs = append(rtmpOutputs, outputURL)
+			}
+			if mediaMTXOutputURL != "" {
+				rtmpOutputs = append(rtmpOutputs, mediaMTXOutputURL, mediaMTXOutputAlias)
+			}
 		}
-		if mediaMTXOutputURL != "" {
-			rtmpOutputs = append(rtmpOutputs, mediaMTXOutputURL, mediaMTXOutputAlias)
-		}
-		clog.Info(ctx, "RTMP outputs", "destinations", rtmpOutputs)
+		clog.Info(ctx, "RTMP outputs", "destinations", rtmpOutputs, "disabled", media.LiveAIDisableRTMPOutput())
 
 		// channel that blocks until after orch selection is complete
 		// avoids a race condition with closing the control channel
@@ -1107,13 +1109,15 @@ func (ls *LivepeerServer) CreateWhip(server *media.WHIPServer) http.Handler {
 				})
 			}()
 
-			if outputURL != "" {
-				rtmpOutputs = append(rtmpOutputs, outputURL)
+			if !media.LiveAIDisableRTMPOutput() {
+				if outputURL != "" {
+					rtmpOutputs = append(rtmpOutputs, outputURL)
+				}
+				if mediamtxOutputURL != "" {
+					rtmpOutputs = append(rtmpOutputs, mediamtxOutputURL, mediaMTXOutputAlias)
+				}
 			}
-			if mediamtxOutputURL != "" {
-				rtmpOutputs = append(rtmpOutputs, mediamtxOutputURL, mediaMTXOutputAlias)
-			}
-			clog.Info(ctx, "RTMP outputs", "destinations", rtmpOutputs)
+			clog.Info(ctx, "RTMP outputs", "destinations", rtmpOutputs, "disabled", media.LiveAIDisableRTMPOutput())
 
 			params := aiRequestParams{
 				node:        ls.LivepeerNode,
@@ -1447,10 +1451,74 @@ func sendHeartbeat(ctx context.Context, node *core.LivepeerNode, liveAIHeartbeat
 	}
 	defer resp.Body.Close()
 
+	body, readErr := io.ReadAll(resp.Body)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		body, _ := io.ReadAll(resp.Body)
 		clog.Errorf(ctx, "heartbeat: failed to send heartbeat %s", resp.Status)
 		clog.Errorf(ctx, "heartbeat: response body: %s", string(body))
 		return
+	}
+	if readErr != nil {
+		clog.Errorf(ctx, "heartbeat: failed to read response body: %s", readErr)
+		return
+	}
+
+	var heartbeatResp struct {
+		TerminatedStreamIds []string `json:"terminatedStreamIds"`
+	}
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &heartbeatResp); err != nil {
+			clog.Errorf(ctx, "heartbeat: failed to parse response: %s; body=%s", err, string(body))
+			return
+		}
+	}
+
+	if len(heartbeatResp.TerminatedStreamIds) > 0 {
+		terminateStreams(ctx, node, heartbeatResp.TerminatedStreamIds, "credit_exhaustion")
+	}
+}
+
+// terminateStreams kicks the input for each live pipeline whose StreamID is in
+// the provided list, triggering the normal cleanup chain (segmenter cancel →
+// cleanupControl → orchCancel). The remote heartbeat service is authoritative
+// for termination decisions (e.g. credit exhaustion); this function just
+// enforces them locally.
+func terminateStreams(ctx context.Context, node *core.LivepeerNode, streamIDs []string, reason string) {
+	if len(streamIDs) == 0 {
+		return
+	}
+	wanted := make(map[string]struct{}, len(streamIDs))
+	for _, id := range streamIDs {
+		wanted[id] = struct{}{}
+	}
+
+	type target struct {
+		streamName string
+		streamID   string
+		stop       func(error)
+	}
+	var targets []target
+
+	node.LiveMu.Lock()
+	for name, pipeline := range node.LivePipelines {
+		if pipeline == nil {
+			continue
+		}
+		if _, ok := wanted[pipeline.StreamID]; !ok {
+			continue
+		}
+		if pipeline.StopStream == nil {
+			continue
+		}
+		targets = append(targets, target{
+			streamName: name,
+			streamID:   pipeline.StreamID,
+			stop:       pipeline.StopStream,
+		})
+	}
+	node.LiveMu.Unlock()
+
+	for _, t := range targets {
+		clog.Infof(ctx, "Terminating live stream due to %s: stream_id=%s stream=%s", reason, t.streamID, t.streamName)
+		t.stop(fmt.Errorf("stream terminated: %s", reason))
 	}
 }

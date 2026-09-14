@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/livepeer/go-livepeer/ai/runner"
 	"github.com/livepeer/go-livepeer/common"
 	"github.com/livepeer/go-livepeer/core"
 	"github.com/livepeer/go-livepeer/eth"
@@ -25,6 +26,31 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+var cliTxRoutes = []string{
+	"/initializeRound",
+	"/activateOrchestrator",
+	"/setOrchestratorConfig",
+	"/bond",
+	"/rebond",
+	"/unbond",
+	"/withdrawStake",
+	"/withdrawFees",
+	"/claimEarnings",
+	"/reward",
+	"/transferTokens",
+	"/requestTokens",
+	"/signMessage",
+	"/vote",
+	"/voteOnProposal",
+	"/setMaxGasPrice",
+	"/setMinGasPrice",
+	"/fundDepositAndReserve",
+	"/fundDeposit",
+	"/unlock",
+	"/cancelUnlock",
+	"/withdraw",
+}
 
 func newMockServer() *httptest.Server {
 	n, _ := core.NewLivepeerNode(&eth.StubClient{}, "./tmp", nil)
@@ -40,6 +66,119 @@ func newMockServer() *httptest.Server {
 	mux := s.cliWebServerHandlers("addr")
 	srv := httptest.NewServer(mux)
 	return srv
+}
+
+func TestCLIPrivilegedRoutesRejectGET(t *testing.T) {
+	n, err := core.NewLivepeerNode(nil, t.TempDir(), nil)
+	require.NoError(t, err)
+	s := &LivepeerServer{LivepeerNode: n, CliTxRoutes: true}
+	mux := s.cliWebServerHandlers("addr")
+
+	routes := []string{
+		"/setBroadcastConfig",
+		"/setMaxPriceForCapability",
+		"/initializeRound",
+		"/activateOrchestrator",
+		"/setOrchestratorConfig",
+		"/setMaxFaceValue",
+		"/setPriceForBroadcaster",
+		"/setMaxSessions",
+		"/bond",
+		"/rebond",
+		"/unbond",
+		"/withdrawStake",
+		"/withdrawFees",
+		"/claimEarnings",
+		"/reward",
+		"/transferTokens",
+		"/requestTokens",
+		"/signMessage",
+		"/vote",
+		"/voteOnProposal",
+		"/setMaxGasPrice",
+		"/setMinGasPrice",
+		"/fundDepositAndReserve",
+		"/fundDeposit",
+		"/unlock",
+		"/cancelUnlock",
+		"/withdraw",
+		"/setLogLevel",
+	}
+
+	for _, route := range routes {
+		t.Run(route, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, route, nil)
+			res := httptest.NewRecorder()
+
+			mux.ServeHTTP(res, req)
+
+			require.Equal(t, http.StatusMethodNotAllowed, res.Code)
+			require.Equal(t, http.MethodPost, res.Header().Get("Allow"))
+		})
+	}
+}
+
+func TestCLITxRoutesDisabledByDefault(t *testing.T) {
+	n, err := core.NewLivepeerNode(nil, t.TempDir(), nil)
+	require.NoError(t, err)
+	s := &LivepeerServer{LivepeerNode: n}
+	mux := s.cliWebServerHandlers("addr")
+
+	for _, route := range cliTxRoutes {
+		for _, method := range []string{http.MethodGet, http.MethodPost} {
+			t.Run(method+" "+route, func(t *testing.T) {
+				req := httptest.NewRequest(method, route, nil)
+				res := httptest.NewRecorder()
+
+				mux.ServeHTTP(res, req)
+
+				require.Equal(t, http.StatusNotFound, res.Code)
+				require.Empty(t, res.Header().Get("Allow"))
+			})
+		}
+	}
+}
+
+func TestCLILocalMutationRoutesRemainEnabled(t *testing.T) {
+	n, err := core.NewLivepeerNode(nil, t.TempDir(), nil)
+	require.NoError(t, err)
+	s := &LivepeerServer{LivepeerNode: n}
+	mux := s.cliWebServerHandlers("addr")
+
+	routes := []string{
+		"/setBroadcastConfig",
+		"/setMaxPriceForCapability",
+		"/setMaxFaceValue",
+		"/setPriceForBroadcaster",
+		"/setMaxSessions",
+		"/setLogLevel",
+	}
+
+	for _, route := range routes {
+		t.Run(route, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, route, nil)
+			res := httptest.NewRecorder()
+
+			mux.ServeHTTP(res, req)
+
+			require.Equal(t, http.StatusMethodNotAllowed, res.Code)
+			require.Equal(t, http.MethodPost, res.Header().Get("Allow"))
+		})
+	}
+}
+
+func TestCLIMutationFormParamsIgnoreQueryString(t *testing.T) {
+	n, err := core.NewLivepeerNode(nil, t.TempDir(), nil)
+	require.NoError(t, err)
+	s := &LivepeerServer{LivepeerNode: n, CliTxRoutes: true}
+	mux := s.cliWebServerHandlers("addr")
+	req := httptest.NewRequest(http.MethodPost, "/transferTokens?to=0x0000000000000000000000000000000000000001&amount=1", nil)
+	res := httptest.NewRecorder()
+
+	mux.ServeHTTP(res, req)
+
+	require.Equal(t, http.StatusBadRequest, res.Code)
+	require.Equal(t, "missing form param: to\n", res.Body.String())
 }
 
 func TestActivateOrchestrator(t *testing.T) {
@@ -58,6 +197,7 @@ func TestActivateOrchestrator(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s, _ := NewLivepeerServer(ctx, "127.0.0.1:1938", n, true, "")
+	s.CliTxRoutes = true
 	mux := s.cliWebServerHandlers("addr")
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -211,6 +351,77 @@ func TestGetStatus(t *testing.T) {
 	expected := fmt.Sprintf(`{"Manifests":{},"InternalManifests":{},"StreamInfo":{},"OrchestratorPool":[],"OrchestratorPoolInfos":null,"Version":"undefined","GolangRuntimeVersion":"%s","GOArch":"%s","GOOS":"%s","RegisteredTranscodersNumber":1,"RegisteredTranscoders":[{"Address":"TestAddress","Capacity":5}],"LocalTranscoding":false,"BroadcasterPrices":{}}`,
 		runtime.Version(), runtime.GOARCH, runtime.GOOS)
 	assert.Equal(expected, string(body))
+}
+
+func TestRegisterLiveRunnersCLIEndpoint(t *testing.T) {
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer healthSrv.Close()
+
+	n, err := core.NewLivepeerNode(nil, t.TempDir(), nil)
+	require.NoError(t, err)
+	orch := newStubOrchestrator()
+	manager := runner.NewLiveRunnerRegistry(runner.LiveRunnerRegistryConfig{Host: orch})
+	t.Cleanup(manager.Stop)
+	n.LiveRunnerManager = manager
+	s := &LivepeerServer{LivepeerNode: n}
+	srv := httptest.NewServer(s.cliWebServerHandlers("addr"))
+	defer srv.Close()
+
+	body := fmt.Sprintf(`{"runners":[{"label":"runner-a","runner_url":"https://runner.example.com","app":"live-video-to-video/scope","capacity":1,"price_info":{"price":10},"health_url":%q}]}`, healthSrv.URL)
+	res, err := http.Post(srv.URL+"/registerLiveRunners", "application/json", strings.NewReader(body))
+	require.NoError(t, err)
+	defer res.Body.Close()
+	require.Equal(t, http.StatusOK, res.StatusCode)
+	var reg runner.StaticLiveRunnerRegistrationResponse
+	require.NoError(t, json.NewDecoder(res.Body).Decode(&reg))
+	require.Len(t, reg.Runners, 1)
+	require.NotEmpty(t, reg.Runners[0].RunnerID)
+	require.True(t, reg.Runners[0].Healthy)
+
+	require.Len(t, manager.Runners(), 1)
+}
+
+func TestRegisterLiveRunnersCLIEndpointInvalidBatchDoesNotMutate(t *testing.T) {
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer healthSrv.Close()
+
+	n, err := core.NewLivepeerNode(nil, t.TempDir(), nil)
+	require.NoError(t, err)
+	orch := newStubOrchestrator()
+	manager := runner.NewLiveRunnerRegistry(runner.LiveRunnerRegistryConfig{Host: orch})
+	t.Cleanup(manager.Stop)
+	initialConfig := fmt.Sprintf(`{"runners":[{"label":"runner-a","runner_url":"https://runner.example.com","app":"live-video-to-video/scope","price_info":{"price":10},"health_url":%q}]}`, healthSrv.URL)
+	_, err = manager.RegisterStaticRunnersJSON([]byte(initialConfig))
+	require.NoError(t, err)
+	n.LiveRunnerManager = manager
+	s := &LivepeerServer{LivepeerNode: n}
+	srv := httptest.NewServer(s.cliWebServerHandlers("addr"))
+	defer srv.Close()
+
+	for _, tt := range []struct {
+		name     string
+		metadata []byte
+	}{
+		{name: "oversized", metadata: []byte(strings.Repeat("a", 1025))},
+		{name: "malformed UTF-8", metadata: []byte{0xff}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"runners":[{"label":"runner-b","runner_url":"https://runner-two.example.com","app":"live-video-to-video/scope","price_info":{"price":10},"health_url":%q},{"label":"runner-c","runner_url":"https://runner-three.example.com","app":"live-video-to-video/scope","metadata":"`, healthSrv.URL))
+			body = append(body, tt.metadata...)
+			body = append(body, []byte(fmt.Sprintf(`","price_info":{"price":10},"health_url":%q}]}`, healthSrv.URL))...)
+			res, err := http.Post(srv.URL+"/registerLiveRunners", "application/json", bytes.NewReader(body))
+			require.NoError(t, err)
+			defer res.Body.Close()
+			require.Equal(t, http.StatusBadRequest, res.StatusCode)
+			require.Len(t, manager.Runners(), 1)
+			require.Contains(t, manager.Runners()[0].URL, "http://localhost:1234/apps/runner_")
+			require.Contains(t, manager.Runners()[0].URL, "/session")
+		})
+	}
 }
 
 func TestGetEthChainID(t *testing.T) {

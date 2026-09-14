@@ -1,6 +1,7 @@
 package pm
 
 import (
+	"crypto/ecdsa"
 	"fmt"
 	"math/big"
 	"sync"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts"
 	ethcommon "github.com/ethereum/go-ethereum/common"
+	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -333,6 +335,32 @@ func TestCreateTicketBatch_UsesSessionParamsInBatch(t *testing.T) {
 	}, batch.TicketExpirationParams)
 }
 
+type ticketCaptureSigner struct {
+	*stubSigner
+	ticket *Ticket
+}
+
+func (s *ticketCaptureSigner) SignTicket(ticket *Ticket) ([]byte, error) {
+	s.ticket = ticket
+	return s.signResponse, nil
+}
+
+func TestCreateTicketBatch_UsesOptionalTicketSigner(t *testing.T) {
+	sender := defaultSender(t)
+	base := sender.signer.(*stubSigner)
+	base.signResponse = RandBytes(42)
+	capture := &ticketCaptureSigner{stubSigner: base}
+	sender.signer = capture
+	sessionID := sender.StartSession(defaultTicketParams(t, RandAddress()))
+
+	batch, err := sender.CreateTicketBatch(sessionID, 1)
+	require.NoError(t, err)
+	require.NotNil(t, capture.ticket)
+	assert.Equal(t, batch.Tickets()[0].Hash(), capture.ticket.Hash())
+	assert.Equal(t, base.signResponse, batch.SenderParams[0].Sig)
+	assert.Empty(t, base.signRequests)
+}
+
 func TestCreateTicketBatch_SingleTicket(t *testing.T) {
 	sender := defaultSender(t)
 	am := sender.signer.(*stubSigner)
@@ -491,7 +519,7 @@ func TestValidateTicketParams_FaceValueTooHigh_ReturnsError(t *testing.T) {
 	assert.EqualError(err, expErrStr)
 }
 
-func TestValidateTicketParams_FaceValueTooLow_ReturnsErr(t *testing.T) {
+func TestValidateTicketParams_AboveMaxProbability_ReturnsErr(t *testing.T) {
 	oldEVMul := evMultiplier
 	evMultiplier = big.NewInt(1)
 	sender := defaultSender(t)
@@ -499,7 +527,7 @@ func TestValidateTicketParams_FaceValueTooLow_ReturnsErr(t *testing.T) {
 
 	ticketParams := &TicketParams{
 		FaceValue:       big.NewInt(1000),
-		WinProb:         maxWinProb,
+		WinProb:         new(big.Int).Add(maxWinProb, big.NewInt(1)),
 		ExpirationBlock: big.NewInt(100),
 	}
 	err := sender.ValidateTicketParams(ticketParams)
@@ -528,14 +556,30 @@ func TestValidateTicketParams_ExpiredParams_ReturnsError(t *testing.T) {
 	err = sender.ValidateTicketParams(&ticketParams)
 	assert.EqualError(t, err, ErrTicketParamsExpired.Error())
 
-	// test nil
+	// test accepted when beyond expiry buffer
 	ticketParams.ExpirationBlock = big.NewInt(105)
 	err = sender.ValidateTicketParams(&ticketParams)
 	assert.Nil(t, err)
 
+	// test zero expiration block rejected
 	ticketParams.ExpirationBlock = big.NewInt(0)
 	err = sender.ValidateTicketParams(&ticketParams)
-	assert.Nil(t, err)
+	assert.EqualError(t, err, "ticketParams expiration block is 0")
+}
+
+func TestValidateTicketParams_ZeroExpirationBlock_HighWinProb_ReturnsError(t *testing.T) {
+	sender := defaultSender(t)
+
+	// Regression test: params with WinProb = maxWinProb advertised together with
+	// ExpirationBlock = 0 must be rejected — they previously returned early and
+	// skipped all economic caps
+	ticketParams := &TicketParams{
+		FaceValue:       big.NewInt(1000),
+		WinProb:         maxWinProb,
+		ExpirationBlock: big.NewInt(0),
+	}
+	err := sender.ValidateTicketParams(ticketParams)
+	assert.EqualError(t, err, "ticketParams expiration block is 0")
 }
 
 func TestValidateTicketParams_GetSenderInfoError(t *testing.T) {
@@ -649,4 +693,75 @@ func maxTicketEVErrStr(ev *big.Rat, maxEV *big.Rat) string {
 
 func maxTotalEVErrStr(ev *big.Rat, numTickets int, maxEV *big.Rat) string {
 	return fmt.Sprintf("total ticket EV %v for %v tickets > max total ticket EV %v", ev.FloatString(5), numTickets, maxEV.FloatString(5))
+}
+
+// Exercise the native batch signing and recipient validation with an ephemeral
+// key. No chain, wallet, remote signer, or real funds are used.
+type guaranteedTicketTestSigner struct{ key *ecdsa.PrivateKey }
+
+func (s guaranteedTicketTestSigner) Account() accounts.Account {
+	return accounts.Account{Address: ethcrypto.PubkeyToAddress(s.key.PublicKey)}
+}
+func (s guaranteedTicketTestSigner) Sign(msg []byte) ([]byte, error) {
+	sig, err := ethcrypto.Sign(accounts.TextHash(msg), s.key)
+	if err == nil {
+		sig[64] += 27
+	}
+	return sig, err
+}
+func TestCreateTicketBatch_GuaranteedTicket(t *testing.T) {
+	key, err := ethcrypto.GenerateKey()
+	require.NoError(t, err)
+	signer := guaranteedTicketTestSigner{key: key}
+	sender := defaultSender(t)
+	sm := sender.senderManager.(*stubSenderManager)
+	sm.info[signer.Account().Address] = sm.info[sender.signer.Account().Address]
+	sender.signer = signer
+	params := defaultTicketParams(t, RandAddress())
+	params.FaceValue = big.NewInt(100)
+	params.WinProb = new(big.Int).Set(maxWinProb)
+	rand := big.NewInt(7)
+	params.RecipientRandHash = ethcrypto.Keccak256Hash(ethcommon.LeftPadBytes(rand.Bytes(), 32))
+	sessionID := sender.StartSession(params)
+	batch, err := sender.CreateTicketBatch(sessionID, 1)
+	require.NoError(t, err)
+	require.Len(t, batch.SenderParams, 1)
+	signed := batch.SenderParams[0]
+	ticket := NewTicket(&params, batch.TicketExpirationParams, batch.Sender, signed.SenderNonce)
+	validator := NewValidator(&DefaultSigVerifier{}, sender.timeManager)
+	require.NoError(t, validator.ValidateTicket(params.Recipient, ticket, signed.Sig, rand))
+	require.True(t, validator.IsWinningTicket(ticket, signed.Sig, rand))
+	require.Zero(t, ticketEV(params.FaceValue, params.WinProb).Cmp(new(big.Rat).SetInt(params.FaceValue)))
+}
+func TestCreateTicketBatch_GuaranteedTicketRetainsGuards(t *testing.T) {
+	for _, name := range []string{"expiry", "ticketEV", "totalEV", "deposit", "faceValue", "withdrawal", "aboveMaxProbability"} {
+		t.Run(name, func(t *testing.T) {
+			sender := defaultSender(t)
+			signer := sender.signer.(*stubSigner)
+			signer.saveSignRequest = true
+			info := sender.senderManager.(*stubSenderManager).info[signer.Account().Address]
+			params := defaultTicketParams(t, RandAddress())
+			params.FaceValue = big.NewInt(100)
+			params.WinProb = new(big.Int).Set(maxWinProb)
+			switch name {
+			case "expiry":
+				params.ExpirationBlock = big.NewInt(0)
+			case "ticketEV":
+				sender.maxEV = big.NewRat(99, 1)
+			case "totalEV":
+				sender.maxTotalEV = big.NewRat(99, 1)
+			case "deposit":
+				info.Deposit = big.NewInt(0)
+			case "faceValue":
+				info.Deposit = big.NewInt(100)
+			case "withdrawal":
+				info.WithdrawRound = big.NewInt(1)
+			case "aboveMaxProbability":
+				params.WinProb.Add(params.WinProb, big.NewInt(1))
+			}
+			_, err := sender.CreateTicketBatch(sender.StartSession(params), 1)
+			require.Error(t, err)
+			require.Empty(t, signer.signRequests)
+		})
+	}
 }
