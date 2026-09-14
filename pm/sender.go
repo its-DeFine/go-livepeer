@@ -206,7 +206,8 @@ func (s *sender) validateTicketParams(ticketParams *TicketParams, numTickets int
 		return nil
 	}
 
-	if ev.Cmp(new(big.Rat).SetInt(ticketParams.FaceValue)) >= 0 {
+	// A certain ticket has EV equal to face value; it must still pass every cap below.
+	if ev.Cmp(new(big.Rat).SetInt(ticketParams.FaceValue)) > 0 {
 		return fmt.Errorf("ticket faceValue too low faceValue=%v", ticketParams.FaceValue)
 	}
 	if ev.Cmp(s.maxEV) > 0 {
