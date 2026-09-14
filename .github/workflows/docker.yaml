@@ -18,7 +18,7 @@ concurrency:
 jobs:
   docker:
     name: Docker image generation
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.repository == 'livepeer/go-livepeer' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
       packages: write
       contents: read
@@ -97,7 +97,7 @@ jobs:
 
   builder:
     name: go-livepeer builder docker image generation
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.repository == 'livepeer/go-livepeer' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
       packages: write
       contents: read
